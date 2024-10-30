@@ -6,7 +6,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     classification_report, confusion_matrix,
@@ -65,41 +65,6 @@ def get_option_contracts(ticker, expiration_date=None):
                 return None
         except Exception as e:
             st.error(f"Error fetching option contracts: {e}")
-            return None
-
-def get_option_aggregates(option_ticker, from_date, to_date):
-    """
-    Fetches historical price data for a specific option contract.
-
-    Parameters:
-    - option_ticker (str): The option contract ticker symbol.
-    - from_date (str): Start date in 'YYYY-MM-DD' format.
-    - to_date (str): End date in 'YYYY-MM-DD' format.
-
-    Returns:
-    - DataFrame containing historical price data.
-    """
-    url = f"{BASE_URL}/v2/aggs/ticker/{option_ticker}/range/1/day/{from_date}/{to_date}"
-    params = {
-        'adjusted': 'true',
-        'sort': 'asc',
-        'limit': 50000,
-        'apiKey': API_KEY
-    }
-    with st.spinner(f"Fetching aggregates for {option_ticker}..."):
-        try:
-            response = requests.get(url, params=params)
-            data = response.json()
-            if 'results' in data and data['results']:
-                df = pd.DataFrame(data['results'])
-                df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
-                df.set_index('timestamp', inplace=True)
-                return df
-            else:
-                st.error(f"No aggregates data found for {option_ticker}")
-                return None
-        except Exception as e:
-            st.error(f"Error fetching aggregates for {option_ticker}: {e}")
             return None
 
 def get_stock_price(ticker, from_date, to_date):
@@ -162,6 +127,17 @@ def calculate_features(contracts_df, stock_df):
         current_price = stock_df['c'].iloc[-1]
         df['moneyness'] = (current_price - df['strike_price']) / df['strike_price']
 
+        # Categorize moneyness
+        df['moneyness_category'] = pd.cut(
+            df['moneyness'],
+            bins=[-np.inf, -0.05, 0.05, np.inf],
+            labels=['OTM', 'ATM', 'ITM']
+        )
+
+        # Encode moneyness_category
+        le = LabelEncoder()
+        df['moneyness_encoded'] = le.fit_transform(df['moneyness_category'])
+
         # Calculate ratios
         df['strike_to_stock_ratio'] = df['strike_price'] / current_price
 
@@ -210,11 +186,10 @@ def prepare_training_data(contracts_df, stock_df, return_threshold):
     - return_threshold (float): Return threshold to define a positive outcome.
 
     Returns:
-    - X_original (DataFrame): Original feature set.
-    - y_original (Series): Original target variable.
+    - X (DataFrame): Original feature set.
+    - y (Series): Original target variable.
     - X_resampled (DataFrame): Resampled feature set for training.
     - y_resampled (Series): Resampled target variable for training.
-    - simulated_returns (Series): Simulated returns for options.
     """
     required_features = [
         'strike_price', 'days_to_expiration', 'moneyness',
@@ -228,35 +203,27 @@ def prepare_training_data(contracts_df, stock_df, return_threshold):
         missing_features = [f for f in required_features if f not in contracts_df.columns]
         if missing_features:
             st.error(f"Missing required features: {missing_features}")
-            return None, None, None, None, None
+            return None, None, None, None
 
         # Create feature matrix
-        X_original = contracts_df[required_features].copy()
+        X = contracts_df[required_features].copy()
 
         # Handle missing values
         imputer = SimpleImputer(strategy='mean')
-        X = pd.DataFrame(imputer.fit_transform(X_original), columns=X_original.columns)
+        X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
 
-        # Generate target variable based on hypothetical performance
-        # For demonstration purposes, we'll simulate option returns
-        # In practice, you should use actual historical option price data
-
-        # Simulate option returns
-        np.random.seed(42)
-        simulated_returns = np.random.normal(0, 0.1, size=len(X))
-        # Do not modify contracts_df here; return simulated_returns instead
-
-        # Define target variable
-        y = (simulated_returns > return_threshold).astype(int)
+        # Define target variable based on moneyness_category
+        # For demonstration, we'll classify options as ITM (1) vs not ITM (0)
+        y = (contracts_df['moneyness_category'] == 'ITM').astype(int)
 
         # Address class imbalance by resampling
         X_resampled, y_resampled = resample_data(X, y)
 
-        return X, y, X_resampled, y_resampled, simulated_returns
+        return X, y, X_resampled, y_resampled
 
     except Exception as e:
         st.error(f"Error in data preparation: {str(e)}")
-        return None, None, None, None, None
+        return None, None, None, None
 
 def resample_data(X, y):
     """
@@ -391,8 +358,8 @@ def evaluate_model(model, X_test, y_test):
         conf_matrix_fig = px.imshow(
             conf_matrix,
             labels=dict(x="Predicted", y="Actual"),
-            x=['Negative', 'Positive'],
-            y=['Negative', 'Positive'],
+            x=['Not ITM', 'ITM'],
+            y=['Not ITM', 'ITM'],
             text_auto=True,
             color_continuous_scale='Blues',
             title="Confusion Matrix"
@@ -402,10 +369,10 @@ def evaluate_model(model, X_test, y_test):
         st.write("""
         **How to Interpret the Confusion Matrix:**
 
-        - **True Positives (TP):** Correctly predicted positive cases (bottom-right cell).
-        - **True Negatives (TN):** Correctly predicted negative cases (top-left cell).
-        - **False Positives (FP):** Incorrectly predicted positive cases (top-right cell).
-        - **False Negatives (FN):** Incorrectly predicted negative cases (bottom-left cell).
+        - **True Positives (TP):** Correctly predicted ITM options (bottom-right cell).
+        - **True Negatives (TN):** Correctly predicted Not ITM options (top-left cell).
+        - **False Positives (FP):** Incorrectly predicted ITM options (top-right cell).
+        - **False Negatives (FN):** Incorrectly predicted Not ITM options (bottom-left cell).
 
         A higher number of TPs and TNs indicates better model performance.
         """)
@@ -519,7 +486,7 @@ def display_opportunity_analysis(enhanced_df, probabilities, threshold):
 
     Parameters:
     - enhanced_df (DataFrame): DataFrame containing options with features.
-    - probabilities (array): Predicted probabilities of being an opportunity.
+    - probabilities (array): Predicted probabilities of being an ITM option.
     - threshold (float): Probability threshold to define a positive prediction.
     """
     st.header("Opportunity Analysis")
@@ -543,7 +510,7 @@ def display_opportunity_analysis(enhanced_df, probabilities, threshold):
     st.subheader("Top Trading Opportunities")
     st.write("""
     These are the top options contracts with the highest predicted opportunity scores.
-    The scores represent the probability that the option will exceed the return threshold.
+    The scores represent the probability that the option is In-The-Money (ITM).
     """)
     top_opportunities = enhanced_df.sort_values(by='opportunity_score', ascending=False).head(10)
     display_cols = [
@@ -605,102 +572,6 @@ def plot_opportunity_heatmap(contracts_df):
         return go.Figure()
 
 ###############################################################################
-#                           BACKTESTING                                       #
-###############################################################################
-
-def backtest_strategy(enhanced_df, initial_capital, trade_size):
-    """
-    Simulates a trading strategy based on the model's predictions.
-
-    Parameters:
-    - enhanced_df (DataFrame): DataFrame containing options with predictions.
-    - initial_capital (float): Starting capital for the backtest.
-    - trade_size (float): Amount to invest in each trade.
-
-    Returns:
-    - results_df (DataFrame): DataFrame containing backtest results over time.
-    - total_profit (float): Total profit or loss from the backtest.
-    - total_return_pct (float): Total return percentage.
-    """
-    # For the backtest, we'll simulate buying options with high opportunity scores
-    # and calculate returns based on the simulated returns
-
-    # Sort options by opportunity score
-    sorted_options = enhanced_df.sort_values(by='opportunity_score', ascending=False)
-
-    # Keep only options with positive predictions
-    positive_options = sorted_options[sorted_options['prediction'] == 1]
-
-    # Calculate the number of trades we can make
-    total_trades = int(initial_capital / trade_size)
-    selected_trades = positive_options.head(total_trades)
-
-    # Calculate profit/loss for each trade
-    selected_trades['profit_loss'] = trade_size * selected_trades['simulated_return']
-    selected_trades['return_%'] = selected_trades['simulated_return'] * 100
-
-    # Cumulative returns
-    selected_trades['cumulative_profit'] = selected_trades['profit_loss'].cumsum()
-    selected_trades['capital'] = initial_capital + selected_trades['cumulative_profit']
-    selected_trades['cumulative_return_%'] = (selected_trades['capital'] - initial_capital) / initial_capital * 100
-
-    # Prepare results DataFrame
-    results_df = selected_trades[['expiration_date', 'ticker', 'profit_loss', 'return_%', 'capital', 'cumulative_return_%']]
-    results_df.reset_index(drop=True, inplace=True)
-
-    # Calculate total profit and return percentage
-    total_profit = results_df['profit_loss'].sum()
-    total_return_pct = (results_df['capital'].iloc[-1] - initial_capital) / initial_capital * 100
-
-    return results_df, total_profit, total_return_pct
-
-def display_backtest_results(results_df, total_profit, total_return_pct):
-    """
-    Displays the backtest results.
-
-    Parameters:
-    - results_df (DataFrame): DataFrame containing backtest results over time.
-    - total_profit (float): Total profit or loss from the backtest.
-    - total_return_pct (float): Total return percentage.
-    """
-    st.header("Backtesting Results")
-    st.write("""
-    The backtest simulates a trading strategy where we invest a fixed amount in each option predicted to be an opportunity.
-    The profit or loss is calculated based on the simulated returns.
-    """)
-
-    # Display summary metrics
-    st.subheader("Backtest Summary")
-    st.write(f"**Total Profit/Loss:** ${total_profit:,.2f}")
-    st.write(f"**Total Return:** {total_return_pct:.2f}%")
-    st.write(f"**Number of Trades Executed:** {len(results_df)}")
-
-    # Display cumulative capital over time
-    st.subheader("Capital Over Time")
-    fig = px.line(results_df, x=results_df.index + 1, y='capital', markers=True,
-                  title='Capital Over Time',
-                  labels={'index': 'Trade Number', 'capital': 'Capital ($)'})
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.write("""
-    **How to Interpret the Capital Over Time Chart:**
-
-    - The chart shows how your capital changes with each trade executed.
-    - An upward trend indicates profitable trades, while a downward trend indicates losses.
-    - It helps assess the overall performance and risk of the trading strategy.
-    """)
-
-    # Display individual trade results
-    st.subheader("Trade Details")
-    st.write("Details of each trade executed during the backtest.")
-    results_display = results_df.copy()
-    results_display['profit_loss'] = results_display['profit_loss'].map('${:,.2f}'.format)
-    results_display['capital'] = results_display['capital'].map('${:,.2f}'.format)
-    results_display['return_%'] = results_display['return_%'].map('{:,.2f}%'.format)
-    results_display['cumulative_return_%'] = results_display['cumulative_return_%'].map('{:,.2f}%'.format)
-    st.dataframe(results_display, use_container_width=True)
-
-###############################################################################
 #                           MAIN APPLICATION                                  #
 ###############################################################################
 
@@ -712,12 +583,12 @@ def main():
     Created by [Gabriel Reyes - gabriel.reyes@gsom.polimi.it]
 
     **Key Features:**
-    - Fetch and display historical stock and options data.
+    - Fetch and display current stock and options data.
     - Perform feature engineering for options analysis.
-    - Train a machine learning model to predict profitable options.
+    - Train a machine learning model to predict ITM options.
     - Visualize model performance and feature importance.
-    - Simulate trading strategies with a backtesting module.
     """)
+
     # Sidebar configuration
     st.sidebar.title("Settings")
     st.sidebar.write("Configure your analysis parameters")
@@ -750,8 +621,8 @@ def main():
     st.sidebar.subheader("Model Parameters")
     return_threshold = st.sidebar.slider(
         "Return Threshold (%) for Positive Outcome",
-        min_value=-20,
-        max_value=20,
+        min_value=-50,
+        max_value=50,
         value=5,
         step=1,
         format="%d%%"
@@ -763,21 +634,6 @@ def main():
         max_value=1.0,
         value=0.5,
         step=0.05
-    )
-
-    st.sidebar.subheader("Backtesting Parameters")
-    initial_capital = st.sidebar.number_input(
-        "Initial Capital ($)",
-        min_value=1000,
-        value=10000,
-        step=1000
-    )
-
-    trade_size = st.sidebar.number_input(
-        "Trade Size ($)",
-        min_value=100,
-        value=1000,
-        step=100
     )
 
     if st.sidebar.button("Analyze Options"):
@@ -821,7 +677,7 @@ def main():
                 enhanced_df = calculate_features(contracts_df, stock_df)
                 if enhanced_df is not None:
                     # Prepare training data
-                    X_original, y_original, X_resampled, y_resampled, simulated_returns = prepare_training_data(
+                    X, y, X_resampled, y_resampled = prepare_training_data(
                         enhanced_df, stock_df, return_threshold
                     )
                     if X_resampled is not None and y_resampled is not None:
@@ -830,14 +686,14 @@ def main():
                         ### Machine Learning Model Training
 
                         **Objective:**
-                        We aim to build a machine learning model that can predict whether an option contract will yield a return above a specified threshold.
+                        We aim to build a machine learning model that can predict whether an option contract is In-The-Money (ITM).
 
                         **Strategy Thesis:**
-                        By analyzing historical data and engineered features, we can identify patterns and indicators that suggest an option is likely to be profitable. The Random Forest classifier is chosen for its ability to handle complex interactions between features and its robustness to overfitting.
+                        By analyzing current data and engineered features, we can identify patterns and indicators that suggest an option is ITM. The Random Forest classifier is chosen for its ability to handle complex interactions between features and its robustness to overfitting.
 
                         **What We're Looking For:**
-                        - High accuracy in predicting profitable options.
-                        - Key features that significantly influence profitability.
+                        - High accuracy in predicting ITM options.
+                        - Key features that significantly influence ITM classification.
                         - A model that can generalize well to unseen data.
                         """)
                         # Split data into train and test sets
@@ -854,10 +710,10 @@ def main():
                             evaluate_model(model, X_test, y_test)
 
                             # Make predictions on the original dataset
-                            probabilities = model.predict_proba(X_original)[:, 1]
+                            probabilities = model.predict_proba(X)[:, 1]
 
-                            # Assign simulated returns to enhanced_df
-                            enhanced_df['simulated_return'] = simulated_returns
+                            # Assign predicted probabilities to enhanced_df
+                            enhanced_df['predicted_probability'] = probabilities
 
                             # Display opportunities analysis
                             display_opportunity_analysis(
@@ -867,32 +723,10 @@ def main():
                             # Interpret model
                             st.header("Model Interpretation")
                             st.write("""
-                            Understanding which features influence the model's predictions the most can provide insights into the key drivers of option profitability.
+                            Understanding which features influence the model's predictions the most can provide insights into the key drivers of an option being In-The-Money (ITM).
                             The SHAP (SHapley Additive exPlanations) values show the impact of each feature on the model's output.
                             """)
-                            plot_feature_importance(model, X_original)
-
-                            # Backtesting
-                            st.header("Backtesting the Strategy")
-                            st.write("""
-                            We will now simulate a trading strategy based on the model's predictions.
-                            The backtest assumes that we invest a fixed amount in each option predicted to be an opportunity.
-
-                            **Strategy Thesis:**
-                            By investing consistently in options identified as high-probability opportunities by our model, we aim to achieve positive returns over time. The backtest helps evaluate the practical performance of this strategy.
-
-                            **What We're Looking For:**
-                            - Positive total profit and return percentage.
-                            - Consistent capital growth over time.
-                            - Insights into the risk and reward profile of the strategy.
-                            """)
-                            # Run backtest
-                            backtest_results, total_profit, total_return_pct = backtest_strategy(
-                                enhanced_df, initial_capital, trade_size
-                            )
-
-                            # Display backtest results
-                            display_backtest_results(backtest_results, total_profit, total_return_pct)
+                            plot_feature_importance(model, X)
 
                         else:
                             st.error("Model training failed")
